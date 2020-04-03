@@ -1,9 +1,18 @@
 #include "../disk/driver.c"
 #include <stdbool.h>
 #include <stdlib.h>
+#include <string.h>
 
 #define UNAVAIL 20
 #define NUM_INODES 256
+
+#define OUT_OF_INODES -1
+#define OUT_OF_BLOCKS -2
+#define DIR_FULL -3
+#define FILE_TOO_BIG -4
+#define PATH_TOO_LONG -5
+#define DIR_NOT_FOUND -6
+#define WRONG_FILETYPE -7
 
 typedef unsigned char byte;
 
@@ -36,9 +45,11 @@ void writeFreeVec(FILE* vdisk, short blockNum, short size, short reserved) {
   for(int _i=0; _i<_n; _i++)\
     *(_dest + _i) = *(_origin + _i);
 
+#define DIR 0
+#define TXT 1
 typedef struct iNode {
   unsigned size;
-  unsigned flags;
+  unsigned flags;    
   short directArr[10];
   short singleInd;
   short doubleInd;
@@ -100,22 +111,32 @@ typedef struct entry {
 
 typedef entry directory[16];
 
-void writeDir(FILE* vdisk, short blockNum, directory dir) {
+void writeDir(FILE* vdisk, short iNum, directory dir) {
+  iNode node;
+  readiNode(vdisk, iNum, &node);
+  if (node.flags != DIR) {
+    fprintf(stderr, "writeDir tried to overwrite a file with a directory\n");
+    exit(1);
+  }
   byte arr[32*16];
   for(int i=0; i<16; i++) {
     arr[i*32] = dir[i].iNodeNum;
     COPY_ARR(dir[i].filename, arr + i*32+1, 31);
   }
-  writeBlock(vdisk, blockNum, arr);
+  writeBlock(vdisk, node.directArr[0], arr);
 }
 
-void readDir(FILE* vdisk, short blockNum, directory dir) {
+short readDir(FILE* vdisk, short iNum, directory dir) {
+  iNode node;
+  readiNode(vdisk, iNum, &node);
+  if (node.flags != DIR) return WRONG_FILETYPE;
   byte arr[32*16];
-  readBlock(vdisk, blockNum, arr);
+  readBlock(vdisk, node.directArr[0], arr);
   for(int i=0; i<16; i++) {
     dir[i].iNodeNum = arr[i*32];
     COPY_ARR(arr + i*32+1, dir[i].filename, 31);
   }
+  return 0;
 }
 
 
@@ -128,6 +149,12 @@ short reserveBit(bitArray* bits, short numBits, short unavail) {
   }
   return -1;
 }
+
+void freeBit(bitArray* bits, short bitNum) {
+  if(!isSetAt(*bits, bitNum))
+    flipAt(bits, bitNum);
+}
+     
 
 short reserveEntry(directory parent, short iNodeNum, char* filename) {
   for(int i=0; i<16; i++) {
@@ -146,24 +173,25 @@ void emptyDir(directory dir) {
   }
 }
 
-char newDir(FILE* vdisk, iNode parentiNode, char* filename) {  
+short newDir(FILE* vdisk, short parentiNum, char* filename) {  
   bitArray freeiNodes;
   readBlock(vdisk, 1, freeiNodes.bytes);
   short iNodeNum = reserveBit(&freeiNodes, NUM_INODES, 1);
-  if (iNodeNum == -1) return 'i';
+  if (iNodeNum == -1) return OUT_OF_INODES;
 
   bitArray freeBlocks;
   readBlock(vdisk, 2, freeBlocks.bytes);
   short blockNum = reserveBit(&freeBlocks, NUM_BLOCKS, UNAVAIL);
-  if (blockNum == -1) return 'b';
+  if (blockNum == -1) return OUT_OF_BLOCKS;
 
   directory parent;
-  readDir(vdisk, parentiNode.directArr[0], parent);
+  short flag = readDir(vdisk, parentiNum, parent);
+  if (flag < 0) return flag;
   short entryNum = reserveEntry(parent, iNodeNum, filename);
-  if (entryNum == -1) return 'e';
+  if (entryNum == -1) return DIR_FULL;
   
   iNode node;
-  node.size = 0;
+  node.size = 512;
   node.flags = 0;
   node.directArr[0] = blockNum;
 
@@ -172,35 +200,63 @@ char newDir(FILE* vdisk, iNode parentiNode, char* filename) {
 
   writeBlock(vdisk, 1, freeiNodes.bytes);
   writeBlock(vdisk, 2, freeBlocks.bytes);
-  writeDir(vdisk, parentiNode.directArr[0], parent);
+  writeDir(vdisk, parentiNum, parent);
   writeiNode(vdisk, iNodeNum, node);
-  writeDir(vdisk, blockNum, dir);
+  writeDir(vdisk, iNodeNum, dir);
   
-  return '0';
+  return iNodeNum;
 }
 
-char newFile(FILE* vdisk, iNode parentiNode, char* filename) {  
+byte searchDir(directory here, char* filename) {
+  for(int i=0; i<16; i++) {
+    if(!strncmp(here[i].filename, filename, 31) &&
+       here[i].iNodeNum != 0) {
+      return here[i].iNodeNum;
+    }
+  }
+  return 0;
+}
+
+void rmEntry(directory here, byte iNum) {
+  for(int i=0; i<16; i++) {
+    if(here[i].iNodeNum == iNum) 
+      here[i].iNodeNum = 0;
+  }
+}
+
+short rmDir(FILE* vdisk, short parentiNum, char* filename) {
+  directory parent;
+  short flag = readDir(vdisk, parentiNum, parent);
+  if (flag < 0) return flag;
+
+  byte iNum = searchDir(parent, filename);
+  if (!iNum) return DIR_NOT_FOUND;
+
+  directory dir;
+  flag = readDir(vdisk, iNum, dir);
+  if (flag < 0) return flag;
+
+  for(int i=0; i<16; i++) {
+    if(dir[i].iNodeNum != 0)
+      return DIR_NOT_EMPTY;
+  }  
+  iNode node;
+  readiNode(vdisk, iNum, node);
+  
+  bitArray freeBlocks;
+  readBlock(vdisk, 1, freeBlocks.bytes);  
+  freeBit(freeBlocks, node.directArr[0]);
+  writeBlock(vdisk, 1 freeBlocks.bytes);
+  
   bitArray freeiNodes;
   readBlock(vdisk, 1, freeiNodes.bytes);
-  short iNodeNum = reserveBit(&freeiNodes, NUM_INODES, 1);
-  if (iNodeNum == -1) return 'i';
-
-  directory parent;
-  readDir(vdisk, parentiNode.directArr[0], parent);
-  short entryNum = reserveEntry(parent, iNodeNum, filename);
-  if (entryNum == -1) return 'e';
+  freeBit(freeiNodes, iNum);
+  writeBlock(vdisk, 2 freeiNodes.bytes);
   
-  iNode node;
-  node.size = 0;
-  node.flags = 1;
-
-  writeBlock(vdisk, 1, freeiNodes.bytes);
-  writeBlock(vdisk, 2, freeBlocks.bytes);
-  writeDir(vdisk, parentiNode.directArr[0], parent);
-  writeiNode(vdisk, iNodeNum, node);
   
-  return '0';
-}
+  
+  
+
 
 
 
@@ -208,33 +264,24 @@ char newFile(FILE* vdisk, iNode parentiNode, char* filename) {
 void makeRoot(FILE* vdisk) {
   iNode node;
   node.size = 0;
-  node.flags = 0;
+  node.flags = DIR;
   node.directArr[0] = 3;
   writeiNode(vdisk, 0x00, node);
 
   directory root;
   emptyDir(root);
 
-  writeDir(vdisk, 3, root);
+  writeDir(vdisk, 0, root);
 }
 
-void initLLFS() {
-  FILE* vdisk = fopen("../disk/vdisk", "w+");  
-                          
+void initLLFS(FILE* vdisk) {                          
   int superblockData[2] = {3, //nblocks
                            0};//ninodes
   writeBlock(vdisk, 0, superblockData);
-
-
   writeFreeVec(vdisk, 1, 256, 1);
   writeFreeVec(vdisk, 2, BLOCK_SIZE, UNAVAIL);
-
   makeRoot(vdisk);
-  iNode rootNode;
-  readiNode(vdisk, 0x00, &rootNode);
-  
-  char flag = newDir(vdisk, rootNode, "John\0");
-  printf("%c\n", flag);
+ 
   
   /*directory root;
   root[0].iNodeBlockNum = 'a';
@@ -246,8 +293,34 @@ void initLLFS() {
   printf("%d %s\n", rootCopy[0].iNodeBlockNum,
          rootCopy[0].filename);
   */  
-  fclose(vdisk);    
+ 
 }
+
+
+
+short newFile(FILE* vdisk, short parentiNum, char* filename) {  
+  bitArray freeiNodes;
+  readBlock(vdisk, 1, freeiNodes.bytes);
+  short iNodeNum = reserveBit(&freeiNodes, NUM_INODES, 1);
+  if (iNodeNum == -1) return OUT_OF_INODES;
+
+  directory parent;
+  short flag = readDir(vdisk, parentiNum, parent);
+  if (flag < 0) return flag;
+  short entryNum = reserveEntry(parent, iNodeNum, filename);
+  if (entryNum == -1) return DIR_FULL;
+
+  iNode node;
+  node.size = 0;
+  node.flags = 1;
+
+  writeBlock(vdisk, 1, freeiNodes.bytes);
+  writeDir(vdisk, parentiNum, parent);
+  writeiNode(vdisk, iNodeNum, node);
+  
+  return iNodeNum;
+}
+
 
 
 
@@ -256,7 +329,7 @@ short sizeToBlocks(unsigned size) {
 }
 
 short newIndBlock(FILE* vdisk, bitArray* freeBlocks, short blockNum) {
-  short indBlockNum = reserveBit(&freeblocks, NUM_BLOCKS, UNAVAIL);
+  short indBlockNum = reserveBit(freeBlocks, NUM_BLOCKS, UNAVAIL);
   if (indBlockNum == -1) return -1;  
   
   short indBlock[256];
@@ -273,71 +346,270 @@ void updateIndBlock(FILE* vdisk, short indBlockNum,
   writeBlock(vdisk, indBlockNum, indBlock);
 }
 
-char addBlock(FILE* vdisk, iNode node) {
+short addBlock(FILE* vdisk, iNode* node) {
   bitArray freeBlocks;
   readBlock(vdisk, 2, freeBlocks.bytes);
   short blockNum = reserveBit(&freeBlocks, NUM_BLOCKS, UNAVAIL);
-  if (blockNum == -1) return 'b';
+  if (blockNum == -1) return OUT_OF_BLOCKS;
   
-  oldNumBlocks = sizeToBlocks(node.size);
+  unsigned oldNumBlocks = sizeToBlocks(node->size);
   if (oldNumBlocks == 10 + 256 + 256*256)
-    return 'f';
+    return FILE_TOO_BIG;
   
   if (oldNumBlocks < 10) {
-    node.directArr[oldNumBlocks] = blockNum;
+    node->directArr[oldNumBlocks] = blockNum;
   } else if (oldNumBlocks == 10) {
     short indBlockNum = newIndBlock(vdisk, &freeBlocks, blockNum);
     if (indBlockNum == -1) {
-      return 'i';
+      return OUT_OF_BLOCKS;
     } else {
-      node.singleInd = indBlockNum;
+      node->singleInd = indBlockNum;
     }
   } else if (oldNumBlocks < 10 + 256) {
-    updateIndBlock(vdisk, node.singleInd,
+    updateIndBlock(vdisk, node->singleInd,
                    oldNumBlocks-10, blockNum);      
   } else if ((oldNumBlocks-10-256) % 256 == 0) {
     short indBlockNum = newIndBlock(vdisk, &freeBlocks, blockNum);
     if (indBlockNum == -1) {
-      return 'i';
+      return OUT_OF_BLOCKS;
     } else if (oldNumBlocks == 10+256) {
-      short doubleIndNum = newIndBlock(&freeblocks, indBlockNum);
+      short doubleIndNum = newIndBlock(vdisk, &freeBlocks, indBlockNum);
       if (doubleIndNum == -1) {
-        return 'd';
+        return OUT_OF_BLOCKS;
       } else {
-        node.doubleInd = doubleIndNum;
+        node->doubleInd = doubleIndNum;
       }
     } else {
-      updateIndBlock(vdisk, node.doubleInd,
+      updateIndBlock(vdisk, node->doubleInd,
                      (oldNumBlocks-10-256)/256, indBlockNum);
     }
   } else {
     short doubleInd[256];
-    readBlock(vdisk, node.doubleInd, doubleInd);
+    readBlock(vdisk, node->doubleInd, doubleInd);
     updateIndBlock(vdisk, doubleInd[(oldNumBlocks-10-256)/256],
                    (oldNumBlocks-10-256)%256, blockNum);
   }
   writeBlock(vdisk, 2, freeBlocks.bytes);
-  return '0';
+  printf("adding block %d\n", blockNum);
+  return blockNum;  
 }
-    
-char growFile(FILE* vdisk, iNode node, unsigned newSize) {
-  oldNumBlocks = sizeToBlocks(node.size);
-  newNumBlocks = sizeToBlocks(newSize);
+ 
+short growFileTo(FILE* vdisk, iNode* node, unsigned newSize) {
+  short oldNumBlocks = sizeToBlocks(node->size);
+  short newNumBlocks = sizeToBlocks(newSize);
+  for(short i=oldNumBlocks; i<newNumBlocks; i++) {
+    node->size = i*512;
+    short blockNum = addBlock(vdisk, node);
+    if (blockNum < 0) return blockNum;
+  }
+  node->size = newSize;
+  return 0;
+}
+
+short getBlockNum(FILE* vdisk, iNode node, short blockPos) {
+  if (blockPos < 10) {
+    return node.directArr[blockPos];
+  } else if (blockPos < 10 + 256) {
+    short singleInd[256];
+    readBlock(vdisk, node.singleInd, singleInd);
+    return singleInd[blockPos-10];
+  } else if (blockPos < 10+256+256*256) {
+    short doubleInd[256];
+    readBlock(vdisk, node.doubleInd, doubleInd);
+    short singleInd[256];
+    readBlock(vdisk, singleInd[(blockPos-10-256)/256], singleInd);
+    return singleInd[(blockPos-10-256)%256];
+  } else {
+    return FILE_TOO_BIG;
+  }
+}        
 
 typedef struct log {
+  short iNum;
   iNode node;
-  short whichBlock;
   char block[512];
-  unsigned ptr;
+  unsigned pos;
 } log;
 
-void seek(FILE* vdisk, log l, short pos) {
-  if (pos > l.node.size) {
-    
-  short whichBlock = pos / 512;
+short file_seek(FILE* vdisk, log* l, unsigned pos) {
+  short flag = growFileTo(vdisk, &(l->node), pos+1);
+  if (flag < 0) {
+    fprintf(stderr, "file_seek ran out of space: %d\n", flag);
+    return flag;
+  }
+  if (pos/512 != l->pos/512) {
+    short oldBlockNum = getBlockNum(vdisk, l->node, l->pos/512);
+    short newBlockNum = getBlockNum(vdisk, l->node, pos/512);
+    printf("switching from block %d to %d\n", oldBlockNum, newBlockNum);
+
+    writeBlock(vdisk, oldBlockNum, l->block);
+    readBlock(vdisk, newBlockNum, l->block);
+    writeiNode(vdisk, l->iNum, l->node);
+  }
+  l->pos = pos;
+  return 0;
+}
+
+void file_writeChar(log* l, char c) {
+  l->block[l->pos % 512] = c;
+}
+
+char file_readChar(log l) {
+  return l.block[l.pos % 512];
+}
+
+void file_writeStr(FILE* vdisk, log* l, char* str, unsigned length) {
+  unsigned startPos = l->pos;
+  short flag = file_seek(vdisk, l, startPos + length-1);
+  if (flag < 0) {
+    fprintf(stderr, "file_writeString couldn't seek\n");
+    return;
+  }
+  for(unsigned i=0; i<length; i++) {
+    file_seek(vdisk, l, startPos + i);   
+    file_writeChar(l, str[i]);
+  }
+}
+
+void file_readStr(FILE* vdisk, log* l, unsigned length, char* str) {
+  for(unsigned i=0; i<length; i++) {
+    short flag = file_seek(vdisk, l, l->pos + i);
+    if (flag < 0) {
+      fprintf(stderr, "file_readStr couldn't seek\n");
+      return;
+    }
+    str[i] = file_readChar(*l);
+  }
+}
+
+
+
+typedef struct filePath {
+  char* tokens[5];
+  short length;
+} filePath;  
+
+void tokenizePath(char* string, filePath* path) {
+  if (!(path->tokens[0] = strtok(string, "/"))) return;
+  for(path->length = 1;
+      (path->tokens[path->length] = strtok(NULL, "/"))
+      && path->length<4+1;        
+      path->length++);                                                     
+}
+
+short walkPath(FILE* vdisk, byte iNum, filePath path) {
+  if (path.length == 0) {
+    return iNum;
+  } else if (path.length == 4+1) {
+    return PATH_TOO_LONG;
+  }  
+  directory here;
+  short flag = readDir(vdisk, iNum, here);
+  if(flag < 0) return flag;
+
+  for(int i=0; i<path.length; i++) {
+    iNum = searchDir(here, path.tokens[i]);
+    if (!iNum) {
+      return DIR_NOT_FOUND;
+    } else {
+      readDir(vdisk, iNum, here);
+      flag = readDir(vdisk, iNum, here);
+      if(flag < 0) return flag;
+    }
+  }
+  return iNum;
+}
+
+short getParent(FILE* vdisk, char pathString[4*31],
+                char dirName[31], directory parent) {
+  filePath path;
+  tokenizePath(pathString, &path);
+  if (path.length <= 0) return DIR_NOT_FOUND;
+  
+  path.length--;
+  COPY_ARR(path.tokens[path.length], dirName, 31);
+  short parentiNum = walkPath(vdisk, 0, path);
+  if (parentiNum < 0) return parentiNum;  
+  
+  iNode parentNode;
+  readiNode(vdisk, parentiNum, &parentNode);
+  if (parentNode.flags != DIR) return DIR_NOT_FOUND;
+
+  readDir(vdisk, parentiNum, parent);
+  return parentiNum;
+}
+
+void file_mkdir(FILE* vdisk, char pathString[4*31]) {
+  char dirName[31];
+  directory parent;
+  short parentiNum = getParent(vdisk, pathString, dirName, parent);  
+  
+  if (searchDir(parent, dirName)) {
+    fprintf(stderr, "file_mkdir: directory %s already exists\n", pathString);
+  } else {
+    short diriNum = newDir(vdisk, parentiNum, dirName);
+    if (diriNum < 0) 
+      fprintf(stderr, "file_mkdir failed to create directory: %d\n", diriNum);
+  }
+}
+
+void file_open(FILE* vdisk, char pathString[4*31], log* l) {
+  char filename[31];
+  directory parent;
+  short parentiNum = getParent(vdisk, pathString, filename, parent);  
+  
+  short iNum = searchDir(parent, filename);
+  if (!iNum) {      
+    iNum = newFile(vdisk, parentiNum, filename);
+    if (iNum < 0) {
+      fprintf(stderr, "file_open failed create file: %d\n", iNum);
+      return;     
+    }/*
+    readiNode(vdisk, iNum, &l->node);
+    addBlock(vdisk, &l->node);
+    writeiNode(vdisk, iNum, l->node);
+  */
+  }
+  l->iNum = iNum;
+  readiNode(vdisk, iNum, &l->node);
+  readBlock(vdisk, l->node.directArr[0], &l->block);
+  l->pos = 0;
+  file_seek(vdisk, l, 0);
+}
+
+void file_close(FILE* vdisk, log* l) {
+  writeiNode(vdisk, l->iNum, l->node);
+  writeBlock(vdisk, getBlockNum(vdisk, l->node, l->pos/512), l->block);
+  l = NULL;
+}
+
 
 int main() {
-  initLLFS();
+  FILE* vdisk = fopen("../disk/vdisk", "w+");  
+  initLLFS(vdisk);
+
+  iNode rootNode;
+  readiNode(vdisk, 0x00, &rootNode);
+  
+  char dirPath[4*31] = "/john";
+  file_mkdir(vdisk, dirPath);
+  
+  log l;
+  char filePath[4*31] = "/john/frum";
+  file_open(vdisk, filePath, &l);
+  /*
+  file_writeChar(&l, 'b');
+  file_seek(vdisk, &l, 1);
+  file_writeChar(&l, 'l');
+  file_seek(vdisk, &l, 2);
+  file_writeChar(&l, 'a');
+  */
+  char bean[16] = "real human bean\0";
+  file_writeStr(vdisk, &l, bean, 16);
+  file_close(vdisk, &l);
+  
+  
+  fclose(vdisk);
   return 0;
 }
 
