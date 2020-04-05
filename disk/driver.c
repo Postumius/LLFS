@@ -10,6 +10,7 @@ void readBlock(FILE* disk, short blockNum, void* buffer) {
 }
 
 void writeBlock(FILE* disk, short blockNum, void* data) {
+  printf("writing to block %d\n", blockNum);
   fseek(disk, blockNum * BLOCK_SIZE, SEEK_SET);
   fwrite(data, BLOCK_SIZE, 1, disk);
 }

@@ -207,51 +207,7 @@ short newDir(FILE* vdisk, short parentiNum, char* filename) {
   return iNodeNum;
 }
 
-byte searchDir(directory here, char* filename) {
-  for(int i=0; i<16; i++) {
-    if(!strncmp(here[i].filename, filename, 31) &&
-       here[i].iNodeNum != 0) {
-      return here[i].iNodeNum;
-    }
-  }
-  return 0;
-}
 
-void rmEntry(directory here, byte iNum) {
-  for(int i=0; i<16; i++) {
-    if(here[i].iNodeNum == iNum) 
-      here[i].iNodeNum = 0;
-  }
-}
-
-short rmDir(FILE* vdisk, short parentiNum, char* filename) {
-  directory parent;
-  short flag = readDir(vdisk, parentiNum, parent);
-  if (flag < 0) return flag;
-
-  byte iNum = searchDir(parent, filename);
-  if (!iNum) return DIR_NOT_FOUND;
-
-  directory dir;
-  flag = readDir(vdisk, iNum, dir);
-  if (flag < 0) return flag;
-
-  for(int i=0; i<16; i++) {
-    if(dir[i].iNodeNum != 0)
-      return DIR_NOT_EMPTY;
-  }  
-  iNode node;
-  readiNode(vdisk, iNum, node);
-  
-  bitArray freeBlocks;
-  readBlock(vdisk, 1, freeBlocks.bytes);  
-  freeBit(freeBlocks, node.directArr[0]);
-  writeBlock(vdisk, 1 freeBlocks.bytes);
-  
-  bitArray freeiNodes;
-  readBlock(vdisk, 1, freeiNodes.bytes);
-  freeBit(freeiNodes, iNum);
-  writeBlock(vdisk, 2 freeiNodes.bytes);
   
   
   
@@ -320,9 +276,6 @@ short newFile(FILE* vdisk, short parentiNum, char* filename) {
   
   return iNodeNum;
 }
-
-
-
 
 short sizeToBlocks(unsigned size) {
   return (size%512 == 0)? size/512: size/512+1;
@@ -482,15 +435,24 @@ void file_readStr(FILE* vdisk, log* l, unsigned length, char* str) {
   }
 }
 
-
+byte searchDir(directory here, char* filename) {
+  for(int i=0; i<16; i++) {
+    if(!strncmp(here[i].filename, filename, 31) &&
+       here[i].iNodeNum != 0) {
+      return here[i].iNodeNum;
+    }
+  }
+  return 0;
+}
 
 typedef struct filePath {
+  char str[4*31];
   char* tokens[5];
   short length;
 } filePath;  
-
 void tokenizePath(char* string, filePath* path) {
-  if (!(path->tokens[0] = strtok(string, "/"))) return;
+  COPY_ARR(string, path->str, 4*31);
+  if (!(path->tokens[0] = strtok(path->str, "/"))) return;
   for(path->length = 1;
       (path->tokens[path->length] = strtok(NULL, "/"))
       && path->length<4+1;        
@@ -542,7 +504,9 @@ short getParent(FILE* vdisk, char pathString[4*31],
 void file_mkdir(FILE* vdisk, char pathString[4*31]) {
   char dirName[31];
   directory parent;
-  short parentiNum = getParent(vdisk, pathString, dirName, parent);  
+  short parentiNum = getParent(vdisk, pathString, dirName, parent);
+  if (parentiNum < 0)
+    fprintf(stderr, "file_mkdir: couldn't follow path\n");
   
   if (searchDir(parent, dirName)) {
     fprintf(stderr, "file_mkdir: directory %s already exists\n", pathString);
@@ -553,6 +517,48 @@ void file_mkdir(FILE* vdisk, char pathString[4*31]) {
   }
 }
 
+void rmEntry(directory here, byte iNum) {
+  for(int i=0; i<16; i++) {
+    if(here[i].iNodeNum == iNum) 
+      here[i].iNodeNum = 0;
+  }
+}
+void file_rmDir(FILE* vdisk, char pathString[4*31]) {
+  char dirName[31];
+  directory parent;
+  short parentiNum = getParent(vdisk, pathString, dirName, parent);
+  if (parentiNum < 0) fprintf(stderr, "file_rmdir: couldn't follow path\n");  
+  byte iNum = searchDir(parent, dirName);
+  if (!iNum) fprintf(stderr, "file_rmdir: couldn't follow path\n");
+  
+  directory dir;
+  short flag = readDir(vdisk, iNum, dir);
+  if (flag < 0) fprintf(stderr, "file_rmdir: %s is not a directory\n", dirName);
+  for(int i=0; i<16; i++) {
+    if(dir[i].iNodeNum != 0) {
+      fprintf(stderr, "file_rmdir: directory isn't empty\n");
+      return;
+    }
+  }  
+  iNode node;
+  readiNode(vdisk, iNum, &node);
+  
+  bitArray freeBlocks;
+  readBlock(vdisk, 2, freeBlocks.bytes);  
+  freeBit(&freeBlocks, node.directArr[0]);
+  writeBlock(vdisk, 2, freeBlocks.bytes);
+  
+  bitArray freeiNodes;
+  readBlock(vdisk, 1, freeiNodes.bytes);
+  freeBit(&freeiNodes, iNum);
+  writeBlock(vdisk, 1, freeiNodes.bytes);
+
+  rmEntry(parent, iNum);
+  writeDir(vdisk, parentiNum, parent);
+}
+
+bool openArr[256];
+
 void file_open(FILE* vdisk, char pathString[4*31], log* l) {
   char filename[31];
   directory parent;
@@ -562,14 +568,16 @@ void file_open(FILE* vdisk, char pathString[4*31], log* l) {
   if (!iNum) {      
     iNum = newFile(vdisk, parentiNum, filename);
     if (iNum < 0) {
-      fprintf(stderr, "file_open failed create file: %d\n", iNum);
+      fprintf(stderr, "file_open failed to create file: %d\n", iNum);
       return;     
-    }/*
-    readiNode(vdisk, iNum, &l->node);
-    addBlock(vdisk, &l->node);
-    writeiNode(vdisk, iNum, l->node);
-  */
+    }
+  } else {
+    if (openArr[iNum]) {
+      fprintf(stderr, "file_open couldn't open %s because it's already open\n", filename);
+      return;
+    }       
   }
+  openArr[iNum] = true;
   l->iNum = iNum;
   readiNode(vdisk, iNum, &l->node);
   readBlock(vdisk, l->node.directArr[0], &l->block);
@@ -580,7 +588,40 @@ void file_open(FILE* vdisk, char pathString[4*31], log* l) {
 void file_close(FILE* vdisk, log* l) {
   writeiNode(vdisk, l->iNum, l->node);
   writeBlock(vdisk, getBlockNum(vdisk, l->node, l->pos/512), l->block);
-  l = NULL;
+  openArr[l->iNum] = false;
+  l->iNum = 0;
+}
+
+void file_rm(FILE* vdisk, char pathString[4*31]) {
+  char filename[31];
+  directory parent;
+  short parentiNum = getParent(vdisk, pathString, filename, parent);
+  if (parentiNum < 0) fprintf(stderr, "file_rm: couldn't follow path\n");  
+  byte iNum = searchDir(parent, filename);
+  if (!iNum) {
+    fprintf(stderr, "file_rm: couldn't follow path\n");
+  } else if (openArr[iNum]) {
+    fprintf(stderr, "file_rm: can't remove %s; it's currently open\n", filename);
+  }
+  iNode node;
+  readiNode(vdisk, iNum, &node);
+  if (node.flags == DIR)
+    fprintf(stderr, "file_rm can't remove %s; it's a directory\n", filename);
+  
+  bitArray freeBlocks;
+  readBlock(vdisk, 2, freeBlocks.bytes);
+  for(int i=0; i<sizeToBlocks(node.size); i++) {
+    freeBit(&freeBlocks, getBlockNum(vdisk, node, i));
+  }
+  writeBlock(vdisk, 2, freeBlocks.bytes);
+
+  bitArray freeiNodes;
+  readBlock(vdisk, 1, freeiNodes.bytes);
+  freeBit(&freeiNodes, iNum);
+  writeBlock(vdisk, 1, freeiNodes.bytes);
+
+  rmEntry(parent, iNum);
+  writeDir(vdisk, parentiNum, parent);
 }
 
 
@@ -607,7 +648,10 @@ int main() {
   char bean[16] = "real human bean\0";
   file_writeStr(vdisk, &l, bean, 16);
   file_close(vdisk, &l);
-  
+
+  file_rm(vdisk, filePath);
+
+  file_rmDir(vdisk, dirPath);
   
   fclose(vdisk);
   return 0;
