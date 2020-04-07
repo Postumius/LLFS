@@ -6,6 +6,14 @@
 #define UNAVAIL 20
 #define NUM_INODES 256
 
+//polymorphic copy
+#define COPY_ARR(_origin, _dest, _n)\
+  for(int _i=0; _i<_n; _i++)\
+    *(_dest + _i) = *(_origin + _i);
+
+
+
+//error codes, these get used a lot
 #define OUT_OF_INODES -1
 #define OUT_OF_BLOCKS -2
 #define DIR_FULL -3
@@ -14,209 +22,16 @@
 #define DIR_NOT_FOUND -6
 #define WRONG_FILETYPE -7
 
-typedef unsigned char byte;
-
-typedef struct bitArray {
-  byte bytes[BLOCK_SIZE];
-} bitArray;
-
-void flipAt(bitArray* arr, size_t i) {
-  byte mask = 0b10000000 >> (i%8);
-  arr->bytes[i/8] ^= mask;
-}
-
-bool isSetAt(bitArray arr, short i) {
-  byte mask = 0b10000000 >> (i%8);
-  return arr.bytes[i/8] & mask;
-}
-
-void writeFreeVec(FILE* vdisk, short blockNum, short size, short reserved) {
-  bitArray freeVec;
-  for(int i=0; i<size; i++) {
-    freeVec.bytes[i] = 0xFF;
-  }
-  for(int i=0; i<reserved; i++) {
-    flipAt(&freeVec, i);
-  }
-  writeBlock(vdisk, blockNum, freeVec.bytes);
-}
-
-#define COPY_ARR(_origin, _dest, _n)\
-  for(int _i=0; _i<_n; _i++)\
-    *(_dest + _i) = *(_origin + _i);
-
+//filetype flags for iNodes
 #define DIR 0
 #define TXT 1
 #define REMOVED_DIR 2
 #define REMOVED 3
 
-typedef struct iNode {
-  unsigned size;
-  unsigned flags;    
-  short directArr[10];
-  short singleInd;
-  short doubleInd;
-} iNode;
-
-typedef union splitInt {
-  int combine;
-  short split[2];
-} spitInt;
-
-void writeiNode(FILE* vdisk, byte iNodeNum, iNode node) {
-  short block[256];
-  readBlock(vdisk, iNodeNum/0x10+UNAVAIL-16, block);  
-  byte start = (iNodeNum % 0x10) * 0x10;
-  
-  union splitInt n;
-  
-  n.combine = node.size;
-  block[start] = n.split[1];
-  block[start+1] = n.split[0];
-
-  n.combine = node.flags;
-  block[start+2] = n.split[1];
-  block[start+3] = n.split[0];
-
-  COPY_ARR(node.directArr,  block+start+4, 10);
-
-  block[start+14] = node.singleInd;
-  block[start+15] = node.doubleInd;
-
-  writeBlock(vdisk, iNodeNum/0x10+UNAVAIL-16, block);
-}
-
-void readiNode(FILE* vdisk, short iNodeNum, iNode* node) {
-  short block[256];
-  readBlock(vdisk, iNodeNum/0x10+UNAVAIL-16, block);
-  byte start = (iNodeNum % 0x10) * 0x10;
-  
-  union splitInt n;
-  
-  n.split[1] = block[start];
-  n.split[0] = block[start+1];
-  node->size = n.combine;
-
-  n.split[1] = block[start+2];
-  n.split[0] = block[start+3];
-  node->flags = n.combine;
-
-  COPY_ARR(block+start+4, node->directArr, 10);
- 
-  node->singleInd = block[start+14];
-  node->doubleInd = block[start+15];
-}
-
-typedef struct entry {
-  byte iNodeNum;
-  char filename[31];
-} entry;
-
-typedef entry directory[16];
-
-void writeDir(FILE* vdisk, short iNum, directory dir) {
-  iNode node;
-  readiNode(vdisk, iNum, &node);
-  if (node.flags != DIR) {
-    fprintf(stderr, "writeDir tried to overwrite a file with a directory\n");
-    exit(1);
-  }
-  byte arr[32*16];
-  for(int i=0; i<16; i++) {
-    arr[i*32] = dir[i].iNodeNum;
-    COPY_ARR(dir[i].filename, arr + i*32+1, 31);
-  }
-  writeBlock(vdisk, node.directArr[0], arr);
-}
-
-short readDir(FILE* vdisk, short iNum, directory dir) {
-  iNode node;
-  readiNode(vdisk, iNum, &node);
-  if (node.flags != DIR) return WRONG_FILETYPE;
-  byte arr[32*16];
-  readBlock(vdisk, node.directArr[0], arr);
-  for(int i=0; i<16; i++) {
-    dir[i].iNodeNum = arr[i*32];
-    COPY_ARR(arr + i*32+1, dir[i].filename, 31);
-  }
-  return 0;
-}
-
-
-short reserveBit(bitArray* bits, short numBits, short unavail) {
-  for(short i=unavail; i<numBits; i++) {
-    if (isSetAt(*bits, i)) {
-        flipAt(bits, i);
-        return i;
-    }
-  }
-  return -1;
-}
-
-void freeBit(bitArray* bits, short bitNum) {
-  if(!isSetAt(*bits, bitNum))
-    flipAt(bits, bitNum);
-}
-     
-
-short reserveEntry(directory parent, short iNodeNum, char* filename) {
-  for(int i=0; i<16; i++) {
-    if (parent[i].iNodeNum == 0x00) {
-      parent[i].iNodeNum = iNodeNum;
-      COPY_ARR(filename, parent[i].filename, 31);
-      return i;      
-    }
-  }
-  return -1;
-}
-
-void emptyDir(directory dir) {
-  for(short i=0; i<16; i++) {
-    dir[i].iNodeNum = 0x00;
-  }
-}
-
-short newDir(FILE* vdisk, short parentiNum, char* filename) {  
-  bitArray freeiNodes;
-  readBlock(vdisk, 1, freeiNodes.bytes);
-  short iNodeNum = reserveBit(&freeiNodes, NUM_INODES, 1);
-  if (iNodeNum == -1) return OUT_OF_INODES;
-
-  bitArray freeBlocks;
-  readBlock(vdisk, 2, freeBlocks.bytes);
-  short blockNum = reserveBit(&freeBlocks, NUM_BLOCKS, UNAVAIL);
-  if (blockNum == -1) return OUT_OF_BLOCKS;
-
-  directory parent;
-  short flag = readDir(vdisk, parentiNum, parent);
-  if (flag < 0) return flag;
-  short entryNum = reserveEntry(parent, iNodeNum, filename);
-  if (entryNum == -1) return DIR_FULL;
-  
-  iNode node;
-  node.size = 512;
-  node.flags = 0;
-  node.directArr[0] = blockNum;
-
-  directory dir;
-  emptyDir(dir);
-
-
-  writeiNode(vdisk, iNodeNum, node);
-  writeDir(vdisk, parentiNum, parent);  
-  writeDir(vdisk, iNodeNum, dir);  
-  writeBlock(vdisk, 2, freeBlocks.bytes);
-  writeBlock(vdisk, 1, freeiNodes.bytes);
-  
-  return iNodeNum;
-}
-
-
-  
-  
-  
-  
-
+#include "bitArray.c"
+#include "iNode.c"
+#include "directory.c"
+#include "txtFile.c"
 
 
 
@@ -241,174 +56,32 @@ void initLLFS(FILE* vdisk) {
   writeFreeVec(vdisk, 1, 256, 1);
   writeFreeVec(vdisk, 2, BLOCK_SIZE, UNAVAIL);
   makeRoot(vdisk);
- 
-  
-  /*directory root;
-  root[0].iNodeBlockNum = 'a';
-  COPY_ARR("john\0", root[0].filename, 4);
-  writeDir(vdisk, 3, root);
 
-  directory rootCopy;
-  readDir(vdisk, 3, rootCopy);
-  printf("%d %s\n", rootCopy[0].iNodeBlockNum,
-         rootCopy[0].filename);
-  */  
- 
 }
-
-
-
-short newFile(FILE* vdisk, short parentiNum, char* filename) {  
-  bitArray freeiNodes;
-  readBlock(vdisk, 1, freeiNodes.bytes);
-  short iNodeNum = reserveBit(&freeiNodes, NUM_INODES, 1);
-  if (iNodeNum == -1) return OUT_OF_INODES;
-
-  directory parent;
-  short flag = readDir(vdisk, parentiNum, parent);
-  if (flag < 0) return flag;
-  short entryNum = reserveEntry(parent, iNodeNum, filename);
-  if (entryNum == -1) return DIR_FULL;
-
-  iNode node;
-  node.size = 0;
-  node.flags = TXT;
-
-  writeBlock(vdisk, 1, freeiNodes.bytes);
-  writeDir(vdisk, parentiNum, parent);
-  writeiNode(vdisk, iNodeNum, node);
-  
-  return iNodeNum;
-}
-
-short sizeToBlocks(unsigned size) {
-  return (size%512 == 0)? size/512: size/512+1;
-}
-
-short newIndBlock(FILE* vdisk, bitArray* freeBlocks, short blockNum) {
-  short indBlockNum = reserveBit(freeBlocks, NUM_BLOCKS, UNAVAIL);
-  if (indBlockNum == -1) return -1;  
-  
-  short indBlock[256];
-  indBlock[0] = blockNum;
-  writeBlock(vdisk, indBlockNum, indBlock);
-  return indBlockNum;
-}
-
-void updateIndBlock(FILE* vdisk, short indBlockNum,
-                     short pos, short newBlockNum) {
-  short indBlock[256];
-  readBlock(vdisk, indBlockNum, indBlock);
-  indBlock[pos] = newBlockNum;
-  writeBlock(vdisk, indBlockNum, indBlock);
-}
-
-short addBlock(FILE* vdisk, bitArray* freeBlocks, iNode* node) {
- 
-  short blockNum = reserveBit(freeBlocks, NUM_BLOCKS, UNAVAIL);
-  if (blockNum == -1) return OUT_OF_BLOCKS;
-  
-  unsigned oldNumBlocks = sizeToBlocks(node->size);
-  if (oldNumBlocks == 10 + 256 + 256*256)
-    return FILE_TOO_BIG;
-  
-  if (oldNumBlocks < 10) {
-    node->directArr[oldNumBlocks] = blockNum;
-  } else if (oldNumBlocks == 10) {
-    short indBlockNum = newIndBlock(vdisk, freeBlocks, blockNum);
-    if (indBlockNum == -1) {
-      return OUT_OF_BLOCKS;
-    } else {
-      node->singleInd = indBlockNum;
-    }
-  } else if (oldNumBlocks < 10 + 256) {
-    updateIndBlock(vdisk, node->singleInd,
-                   oldNumBlocks-10, blockNum);      
-  } else if ((oldNumBlocks-10-256) % 256 == 0) {
-    short indBlockNum = newIndBlock(vdisk, freeBlocks, blockNum);
-    if (indBlockNum == -1) {
-      return OUT_OF_BLOCKS;
-    } else if (oldNumBlocks == 10+256) {
-      short doubleIndNum = newIndBlock(vdisk, freeBlocks, indBlockNum);
-      if (doubleIndNum == -1) {
-        return OUT_OF_BLOCKS;
-      } else {
-        node->doubleInd = doubleIndNum;
-      }
-    } else {
-      updateIndBlock(vdisk, node->doubleInd,
-                     (oldNumBlocks-10-256)/256, indBlockNum);
-    }
-  } else {
-    short doubleInd[256];
-    readBlock(vdisk, node->doubleInd, doubleInd);
-    updateIndBlock(vdisk, doubleInd[(oldNumBlocks-10-256)/256],
-                   (oldNumBlocks-10-256)%256, blockNum);
-  }
-  printf("adding block %d\n", blockNum);
-  return blockNum;  
-}
- 
-short growFileTo(FILE* vdisk, byte iNum, unsigned newSize) {
-  iNode node;
-  readiNode(vdisk, iNum, &node);  
-  if(newSize <= node.size) return 0;
-  bitArray freeBlocks;
-  readBlock(vdisk, 2, freeBlocks.bytes);
-  
-  short oldNumBlocks = sizeToBlocks(node.size);
-  short newNumBlocks = sizeToBlocks(newSize);
-  for(short i=oldNumBlocks; i<newNumBlocks; i++) {
-    node.size = i*512;
-    short blockNum = addBlock(vdisk, &freeBlocks, &node);
-    if (blockNum < 0) return blockNum;
-  }
-  node.size = newSize;
-  writeiNode(vdisk, iNum, node);
-  writeBlock(vdisk, 2, freeBlocks.bytes);
-  return 0;
-}
-
-short getBlockNum(FILE* vdisk, iNode node, short blockPos) {
-  if (blockPos < 10) {
-    return node.directArr[blockPos];
-  } else if (blockPos < 10 + 256) {
-    short singleInd[256];
-    readBlock(vdisk, node.singleInd, singleInd);
-    return singleInd[blockPos-10];
-  } else if (blockPos < 10+256+256*256) {
-    short doubleInd[256];
-    readBlock(vdisk, node.doubleInd, doubleInd);
-    short singleInd[256];
-    readBlock(vdisk, singleInd[(blockPos-10-256)/256], singleInd);
-    return singleInd[(blockPos-10-256)%256];
-  } else {
-    return FILE_TOO_BIG;
-  }
-}        
-
 typedef struct log {
   short iNum;
-  //iNode node;
   char* block;
   unsigned pos;
+  unsigned size;
 } log;
 
 short file_seek(FILE* vdisk, log* l, unsigned pos) {
-  printf("writing to file %d\n", l->iNum);
-  iNode node;
-  readiNode(vdisk, l->iNum, &node);
-  
-  short flag = growFileTo(vdisk, l->iNum, pos+1);
-  if (flag < 0) {
-    fprintf(stderr, "file_seek ran out of space: %d\n", flag);
-    return flag;
+  if (sizeToBlocks(pos+1) > sizeToBlocks(l->size)) {
+    short flag = growFileTo(vdisk, l->iNum, pos+1);
+    if (flag < 0) {
+      fprintf(stderr, "file_seek ran out of space: %d\n", flag);
+      return flag;
+    }
+  }
+  if(pos >= l->size) {
+    l->size = pos+1;
   }
   if (pos/512 != l->pos/512) {
+    iNode node;
+    readiNode(vdisk, l->iNum, &node);
     short oldBlockNum = getBlockNum(vdisk, node, l->pos/512);
     short newBlockNum = getBlockNum(vdisk, node, pos/512);
-    printf("switching from block %d to %d\n", oldBlockNum, newBlockNum);
-
+    
     writeBlock(vdisk, oldBlockNum, l->block);
     readBlock(vdisk, newBlockNum, l->block);
   }
@@ -438,8 +111,9 @@ void file_writeStr(FILE* vdisk, log* l, char* str, unsigned length) {
 }
 
 void file_readStr(FILE* vdisk, log* l, unsigned length, char* str) {
+  unsigned startPos = l->pos;
   for(unsigned i=0; i<length; i++) {
-    short flag = file_seek(vdisk, l, l->pos + i);
+    short flag = file_seek(vdisk, l, startPos + i);
     if (flag < 0) {
       fprintf(stderr, "file_readStr couldn't seek\n");
       return;
@@ -608,11 +282,16 @@ log file_open(FILE* vdisk, char pathString[4*31]) {
   short iNum = searchDir(parent, filename);
   if (!iNum) {      
     iNum = newFile(vdisk, parentiNum, filename);
+    l.size = 0;
     if (iNum < 0) {
       fprintf(stderr, "file_open failed to create file: %d\n", iNum);
       return l;     
-    }
+    } 
   } else {
+    iNode node;
+    readiNode(vdisk, iNum, &node);
+    readBlock(vdisk, node.directArr[0], l.block);
+    l.size = node.size;
     if (openArr[iNum]) {
       fprintf(stderr, "file_open couldn't open %s because it's already open\n", filename);
       return l;
@@ -620,18 +299,14 @@ log file_open(FILE* vdisk, char pathString[4*31]) {
   }
   openArr[iNum] = true;
   l.iNum = iNum;
-  iNode node;
-  readiNode(vdisk, iNum, &node);
-  readBlock(vdisk, node.directArr[0], &l.block);
-  l.pos = 0;
-  file_seek(vdisk, &l, 0);
+  l.pos = 0;  
   return l;
 }
 
 void file_close(FILE* vdisk, log* l) {
   iNode node;
   readiNode(vdisk, l->iNum, &node);
-  
+  node.size = l->size;
   writeiNode(vdisk, l->iNum, node);
   writeBlock(vdisk, getBlockNum(vdisk, node, l->pos/512), l->block);
   openArr[l->iNum] = false;
@@ -689,6 +364,36 @@ void file_rm(FILE* vdisk, char pathString[4*31]) {
   rm(vdisk, parentiNum, iNum);  
 }
 
+void indent(int numIndents) {
+  printf("\n");
+  for(int i=0; i<numIndents; i++) {
+    printf("  ");
+  }
+}
+
+void showRec(FILE* vdisk, int depth, byte iNum) {
+  iNode node;
+  readiNode(vdisk, iNum, &node);
+  if(node.flags == DIR) {
+    directory dir;
+    readDir(vdisk, iNum, dir);
+    for(int i=0; i<16; i++) {
+      if(dir[i].iNodeNum != 0) {
+        indent(depth+1);
+        printf("%s", dir[i].filename);
+        showRec(vdisk, depth+1, dir[i].iNodeNum);
+      }      
+    }
+  } else if(node.flags == TXT) {
+    printf(" %dB", node.size);
+  }
+}    
+
+void file_show(FILE* vdisk) {
+  printf("root");
+  showRec(vdisk, 0, 0);
+  printf("\n");
+}
 
 void checkRec(FILE* vdisk, bitArray freeiNodes, bitArray freeBlocks,
                short iNum) {
@@ -741,20 +446,74 @@ int main() {
 
   iNode rootNode;
   readiNode(vdisk, 0x00, &rootNode);
+
+  printf("create file in root directory\n");
+  log l1 = file_open(vdisk, "/file1");
+  file_show(vdisk);  
+  printf("\nwrite to file\n");
+  file_writeStr(vdisk, &l1, "I am file 1\0", 12);
+  file_close(vdisk, &l1);
+  file_show(vdisk);  
   
-  char dirPath[4*31] = "/john";
-  file_mkdir(vdisk, dirPath);
+  printf("\nread file\n");  
+  l1 = file_open(vdisk,"/file1");
+  char str1[13];  
+  file_readStr(vdisk, &l1, 12, str1);
+  printf("'%s'\n", str1);
+
+  printf("\ncreate subdirectories\n");
+  file_mkdir(vdisk, "/dir1");
+  file_mkdir(vdisk, "/dir1/dir2");
+  file_mkdir(vdisk, "/dir1/dir3");
+  file_mkdir(vdisk, "/dir1/dir3/dir4");
+  file_show(vdisk);
+
+  printf("\ncreate file in arbitrary directory\n");
+  log l2 = file_open(vdisk, "/dir1/dir3/file2");
+  printf("write to file at position 10 000\n");
+  file_seek(vdisk, &l2, 10000);
+  file_writeStr(vdisk, &l2, "I am file 2\0", 12);
+  file_close(vdisk, &l2);
+  file_show(vdisk);
+
+  printf("\nread file at position 10 000\n");
+  l2 = file_open(vdisk, "/dir1/dir3/file2");
+  file_seek(vdisk, &l2, 10000);
+  char str2[13];  
+  file_readStr(vdisk, &l2, 12, str2);
+  printf("'%s'\n", str2);
+
+  printf("\nremoving files and some directories\n");
+  file_close(vdisk, &l1);
+  file_rm(vdisk, "/file1");
+  file_show(vdisk);
+  file_rmDir(vdisk, "/dir1/dir3/dir4");
+  file_show(vdisk);
+  file_close(vdisk, &l2);
+  file_rm(vdisk, "/dir1/dir3/file2");
+  file_show(vdisk);
+  file_rmDir(vdisk, "/dir1/dir3/");
+  file_show(vdisk);
+  /*
+  file_mkdir(vdisk, "/john");
+  file_mkdir(vdisk, "/ABC");
+  file_mkdir(vdisk, "/ABC/def");
   
-  char filePath[4*31] = "/john/frum";
-  log l = file_open(vdisk, filePath);
-  
+  char filePath[4*31] = "/john/frum\0";
+  log l = file_open(vdisk, "john/frum");
+  log n = file_open(vdisk, "john/neighbour");
+    
   char bean[16] = "real human bean\0";
   file_writeStr(vdisk, &l, bean, 16);
   file_close(vdisk, &l);
 
+  file_show(vdisk);
+
   file_rm(vdisk, filePath);
+  file_show(vdisk);
 
   file_rmDir(vdisk, dirPath);
+  */
   
   fclose(vdisk);
   return 0;
